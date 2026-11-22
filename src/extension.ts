@@ -43,7 +43,7 @@ import * as render from "./render.ts";
 import { SNAPCOMPACT_ARCHIVE_KEY, boundArchiveText, serializeMessages, type LlmMessage } from "./serialize.ts";
 import { SHAPE_NAMES, frameRows, frameTokens, resolveShape, type Shape } from "./shapes.ts";
 
-const snapVersion = "1.2.0";
+const snapVersion = "1.2.1";
 
 // pi's compaction-summary framing (dist/core/messages.js, v1.6.0). Not exported
 // from the public entry; inlined so the rebuilt summary row reads exactly like a
@@ -60,6 +60,12 @@ const FRAME_NOTE =
 	"summary — consult them before claiming anything from earlier in the session " +
 	"is unknown.";
 
+const TEXT_ARCHIVE_HEADER =
+	MARKER +
+	" The earlier part of this conversation was " +
+	"compacted into a bounded text archive instead of bitmap frames (the " +
+	"frames would not have shrunk it; head and tail kept, middle elided).\n\n";
+
 const DEFAULTS: Record<string, unknown> = {
 	max_frames: 48,
 	shape: "auto",
@@ -69,6 +75,9 @@ const DEFAULTS: Record<string, unknown> = {
 	tool_result_head_ratio: 0.6,
 	tool_arg_max_chars: 500,
 	tool_call_max_chars: 2_000,
+	nonvision_max_chars: 24_000, // inline bound when a pass lands as text
+	min_middle_tokens: 1_200, // never bother below this (unless manual)
+	min_shrink_ratio: 0.9, // frames must bill < 90% of the middle's estimate
 	compact_at_percent: 100, // compact when usage >= pct of window (100 = pi's own trigger governs)
 };
 
@@ -83,7 +92,7 @@ interface SnapCompactDetails {
 	shape: string;
 	model: string;
 	middle_messages: number;
-	economics: "frames"; // vision => frames, always
+	economics: "frames" | "text_archive";
 	/** Gate economics, persisted so every compaction is auditable in the session file. */
 	est_middle_tokens?: number; // estimated tokens of the serialized middle
 	est_frame_tokens?: number; // what the planned frames would bill (pages x frameTokens)
@@ -291,7 +300,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
 		dbg(`before_compact reason=${event.reason} middle=${event.preparation?.messagesToSummarize?.length ?? "?"} prefix=${event.preparation?.turnPrefixMessages?.length ?? "?"} model=${modelId(ctx)}`);
 		const cfg = loadConfig(ctx.cwd);
-		const { preparation, branchEntries, signal } = event;
+		const { preparation, reason, branchEntries, signal } = event;
 		if (signal?.aborted) return { cancel: true };
 
 		const vision = visionCapable(ctx, cfg);
@@ -328,36 +337,58 @@ export default function (pi: ExtensionAPI) {
 		const shape = resolveShape(modelId(ctx), str(cfg, "shape", "auto"));
 		const maxFrames = Math.trunc(num(cfg, "max_frames", 48));
 
-		// Vision => frames, always: the frames are the exact record, so there is
-		// no shrink-gate economic fallback and no LLM summarizer anywhere in this
-		// path. nFrames === 0 is unreachable for a non-empty archive; guard anyway
-		// and defer to pi's own compaction.
+		// Frames only when they genuinely shrink the middle: nFrames pages bill
+		// nFrames x frameTokens regardless of how much ink lands on each page
+		// (short-line conversations run ~50% page waste), so an ungated render
+		// can INFLATE the context and re-prefill pages of images per request
+		// (measured: 41 frames billed ~115k tokens against a 70k-token middle).
+		// Manual /compact always renders frames — the user asked for them.
+		// Automatic passes that lose the math fall to the bounded text archive
+		// (exact, no LLM in the loop); non-vision models were handled above.
+		const minMiddleTokens = num(cfg, "min_middle_tokens", 1_200);
+		const minShrinkRatio = num(cfg, "min_shrink_ratio", 0.9);
 		const estMiddle = estimateMessagesTokensRough(middleMsgs);
 		const rowsPerFrame = frameRows(shape);
 		const [nFrames, omittedPlan] = render.planFrames(archive, shape, maxFrames);
 		const estFrames = nFrames * frameTokens(shape, rowsPerFrame);
-		if (nFrames === 0) return undefined;
-		const [pngs, omitted] = render.renderFrames(archive, shape, maxFrames);
+		const gate =
+			reason === "manual" ||
+			(estMiddle >= minMiddleTokens && estFrames < estMiddle * minShrinkRatio);
+		let useFrames = Boolean(nFrames && gate);
+		let pngs: Uint8Array[] = [];
+		let omitted = 0;
+		if (useFrames) {
+			const [rendered, omittedRender] = render.renderFrames(archive, shape, maxFrames);
+			pngs = rendered;
+			omitted = omittedRender;
+		} else {
+			dbg(`gateReject reason=${reason} est_mid=${Math.round(estMiddle)} est_fr=${Math.round(estFrames)} pages=${nFrames} -> text_archive`);
+		}
 
-		const summaryText = MARKER + " The earlier part of this conversation was compacted. The images attached to this message are its archive: dense pages of pixel text read top-left to bottom-right, oldest first. They are exact, not paraphrased. Read them like text before answering questions about earlier work, decisions, file paths, or instructions.";
+		const summaryText = useFrames
+			? MARKER + " The earlier part of this conversation was compacted. The images attached to this message are its archive: dense pages of pixel text read top-left to bottom-right, oldest first. They are exact, not paraphrased. Read them like text before answering questions about earlier work, decisions, file paths, or instructions."
+			: TEXT_ARCHIVE_HEADER +
+				boundArchiveText(archive, num(cfg, "nonvision_max_chars", 24_000));
 
 		const details: SnapCompactDetails = {
 			v: 1,
 			engine: "snapcompact",
 			marker: MARKER,
 			archive: boundArchiveText(archive, num(cfg, "archive_source_max_chars", 48_000)),
-			frames: pngs.length,
+			frames: useFrames ? pngs.length : 0,
 			omitted_oldest: omitted,
 			shape: shape.name,
 			model: modelId(ctx),
 			middle_messages: middleMsgs.length,
-			economics: "frames",
+			economics: useFrames ? "frames" : "text_archive",
 			est_middle_tokens: Math.round(estMiddle),
 			est_frame_tokens: Math.round(estFrames),
 			pages: nFrames,
 		};
 
-		stashPut(sha256(summaryText), { pngs: pngs.map((b) => Buffer.from(b).toString("base64")), omitted, shape, details });
+		if (useFrames) {
+			stashPut(sha256(summaryText), { pngs: pngs.map((b) => Buffer.from(b).toString("base64")), omitted, shape, details });
+		}
 		lastStatus.shape = shape.name;
 		lastStatus.last_pass = {
 			frames: details.frames,
@@ -386,6 +417,11 @@ export default function (pi: ExtensionAPI) {
 			const key = sha256(msg.summary);
 			const hit = stashGet(key, ctx);
 			if (!hit) continue;
+			// Text-archive passes are self-contained: the bounded text already
+			// rides in the summary row, and attaching frames for them would
+			// re-ship the pages the economics gate rejected. Only frames-passes
+			// carry images.
+			if (hit.details?.economics !== "frames") continue;
 			// Frames belong inside a user-role row: convertToLlm passes user
 			// messages through untouched, while it would discard image content on
 			// a compactionSummary row (it rebuilds that role from summary text).

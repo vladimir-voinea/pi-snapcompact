@@ -158,12 +158,50 @@ const results: Record<string, unknown> = {};
 	sessionEntries = [...sessionEntries, legacyEntry];
 	const legacyRow = { role: "compactionSummary", summary: legacyEntry.summary, tokensBefore: 42, timestamp: 8 };
 	const ctxEvent = { type: "context", messages: [legacyRow] };
-	await contextHook(ctxEvent, makeCtx());
-	const rebuilt = (ctxEvent.messages as { role: string; content: { type: string; text?: string }[] }[])[0];
+	const hookRes = await contextHook(ctxEvent, makeCtx());
+	const rowAfter = (ctxEvent.messages as { role: string; summary?: string }[])[0];
 	results.nonvisionContextRow = {
-		rowRole: rebuilt.role,
-		archiveInline: JSON.stringify(rebuilt.content).includes("AssertionError: devices is {}"),
-		noImageParts: rebuilt.content.every((c) => c.type !== "image"),
+		hookReturnsUndefined: hookRes === undefined,
+		rowLeftAsSummary: rowAfter.role === "compactionSummary",
+		summaryCarriesNothingNew: "summary" in rowAfter && rowAfter.summary === legacyEntry.summary,
+	};
+	// Same for a legacy text_archive row under a VISION model: the bounded text
+	// already rides in the summary; no images are re-attached (no double-carriage).
+	visionModel = { provider: "anthropic", id: "claude-opus-4-5", input: ["text", "image"] };
+	const legacyRowVision = { ...legacyRow, timestamp: 9 };
+	const ctxEventVision = { type: "context", messages: [legacyRowVision] };
+	const hookResVision = await contextHook(ctxEventVision, makeCtx());
+	results.legacyTextRowOnVision = {
+		hookReturnsUndefined: hookResVision === undefined,
+		rowUntouched: (ctxEventVision.messages[0] as { role: string }).role === "compactionSummary",
+	};
+}
+
+// --- economics gate: frames that would bill >= 90% of the middle -> text ------
+{
+	process.env.PI_SNAPCOMPACT_MIN_SHRINK_RATIO = "0.1"; // impossible: always reject
+	const event = {
+		preparation: { messagesToSummarize: middle, turnPrefixMessages: [], previousSummary: undefined, tokensBefore: 80_000, firstKeptEntryId: "e4", settings: {} },
+		branchEntries: [], reason: "threshold", willRetry: false, signal: undefined,
+	};
+	const res = (await beforeCompact(event, makeCtx())) as { compaction: { summary: string; details: Record<string, never> } };
+	delete process.env.PI_SNAPCOMPACT_MIN_SHRINK_RATIO;
+	const d = res.compaction.details["_snapcompact_archive" as never] as unknown as Record<string, unknown>;
+	results.econGateReject = {
+		economicsTextArchive: d.economics === "text_archive",
+		framesNotRendered: d.frames === 0,
+		summaryIsBoundedText: res.compaction.summary.includes("instead of bitmap frames"),
+		archiveStillDurable: (d.archive as string).length > 1000,
+		estFieldsRecorded: (d.est_frame_tokens as number) > 0 && (d.est_middle_tokens as number) > 0,
+	};
+	// its summary row must NOT get frames re-attached at request time
+	sessionEntries = [...sessionEntries, { type: "compaction", summary: res.compaction.summary, tokensBefore: 80_000, timestamp: 11, details: res.compaction.details }];
+	const rejectRow = { role: "compactionSummary", summary: res.compaction.summary, tokensBefore: 80_000, timestamp: 12 };
+	const rejectEvent = { type: "context", messages: [rejectRow] };
+	const rejectRes = await contextHook(rejectEvent, makeCtx());
+	results.econGateNoImages = {
+		hookReturnsUndefined: rejectRes === undefined,
+		rowLeftAsSummary: (rejectEvent.messages[0] as { role: string }).role === "compactionSummary",
 	};
 }
 

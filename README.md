@@ -55,9 +55,15 @@ switch) — same text + shape ⇒ same bytes.
 
 ## Fallback ladder
 
-1. **Vision model** → bitmap frames, always. No shrink-gate, no text fallback:
-   the frames are the exact record, and no LLM summarizer is ever invoked.
-2. **No image input** → pass handed to pi's built-in (LLM-summary) compaction,
+1. **Vision model, frames bill < 90% of the middle's estimate** → bitmap frames
+   ride on the summary row (no LLM anywhere; frames are the exact record).
+2. **Vision model, frames lose the economics** → bounded text archive inline
+   (exact serialized head+tail, middle elided). Pages bill their full patch
+   price regardless of how much ink lands on them, so an ungated render can
+   *inflate* the context — measured: 41 frames billed ~115k tokens against a
+   70k-token middle.
+3. **Manual `/compact`** → always frames, bypassing the economics gate.
+4. **No image input** → pass handed to pi's built-in (LLM-summary) compaction,
    exactly as stock pi.
 
 If the active model loses image input after a frames pass, the `context` hook
@@ -82,6 +88,9 @@ Under the `snapcompact` key in `~/.pi/agent/settings.json` or project
 | `tool_result_head_ratio` | `0.6` | Head share of a truncated tool result. |
 | `tool_arg_max_chars` | `500` | Per-value cap of tool-call arguments. |
 | `tool_call_max_chars` | `2000` | Per-call cap of tool-call arguments. |
+| `nonvision_max_chars` | `24000` | Bound of the inline text archive when a pass lands as text. |
+| `min_middle_tokens` | `1200` | Skip automatic compactions of smaller middles (manual passes bypass). |
+| `min_shrink_ratio` | `0.9` | Frames must bill < 90% of the middle's token estimate, or the pass lands as text. |
 | `compact_at_percent` | `100` | Compact when context usage ≥ this % of the **live** window (from `turn_end`). `100` defers to pi's own `reserveTokens` trigger — set it below 100 for window-relative control regardless of which model is active. Pair the model with `reserveTokens: 0` in `compaction.modelOverrides` so the absolute check never fires first. |
 
 Compaction *triggers* (`reserveTokens`, `keepRecentTokens`) stay pi's own — see
