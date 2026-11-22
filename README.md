@@ -87,6 +87,18 @@ Under the `snapcompact` key in `~/.pi/agent/settings.json` or project
 Compaction *triggers* (`reserveTokens`, `keepRecentTokens`) stay pi's own — see
 pi's compaction docs.
 
+## License & credits
+
+- **Code:** GPL-2.0-or-later (`LICENSE`). A port of
+  [hermes-snapcompact](https://github.com/vimona3ds/hermes-snapcompact) by
+  vimona3ds — the engine semantics, serializer, layout and billing models come
+  from that plugin; this repo reimplements them on pi's extension hooks in
+  TypeScript.
+- **Font:** the renderer embeds a glyph cache extracted from
+  [GNU Unifont](https://mirrors.kernel.org/gnu/unifont/unifont-17.0.04/)
+  (GPL-2.0-or-later with the GNU Font Embedding Exception) — see
+  `assets/fonts/NOTICE-Unifont`.
+
 ## Frame shapes (from the original)
 
 | Shape | Layout | Billing model |
