@@ -1,6 +1,6 @@
 /**
  * Event-flow harness, part 1 (fresh process = empty stash):
- * frames pass -> context rebuild, nonvision default, text-archive mode, command.
+ * frames pass -> context rebuild, nonvision default, legacy text-archive row, command.
  */
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
@@ -25,6 +25,7 @@ let visionModel: unknown = {
 };
 
 const tmpDir = mkdtempSync(join(tmpdir(), "snapcompact-test-"));
+process.env.PI_CODING_AGENT_DIR = tmpDir; // keep the real ~/.pi settings out of the test
 
 let usagePercent: number | null = null;
 let compactCalls = 0;
@@ -148,35 +149,21 @@ const results: Record<string, unknown> = {};
 	results.nonvisionDefault = { fallsBackToDefaultCompaction: res === undefined };
 }
 
-// --- pass 3: nonvision + text_archive mode -> deterministic bounded text ------
+// --- legacy text-archive entry on a nonvision model: context hook swaps in ----
+// the bounded archive text inline (durable archive from entry details), so old
+// v1.x text_archive rows stay readable on models without image input.
 {
-	process.env.PI_SNAPCOMPACT_NONVISION_MODE = "text_archive";
-	const event = {
-		preparation: { messagesToSummarize: middle, turnPrefixMessages: [], previousSummary: undefined, tokensBefore: 50_000, firstKeptEntryId: "e3", settings: {} },
-		branchEntries: [], reason: "threshold", willRetry: false, signal: undefined,
-	};
-	const res = (await beforeCompact(event, makeCtx())) as { compaction: { summary: string; details: Record<string, never> } };
-	delete process.env.PI_SNAPCOMPACT_NONVISION_MODE;
-	const d = res.compaction.details["_snapcompact_archive" as never] as unknown as Record<string, unknown>;
-	results.nonvisionTextArchive = {
-		returned: Boolean(res),
-		hasTextArchiveHeader: res.compaction.summary.includes("bounded text archive follows"),
-		carriesArchiveText: res.compaction.summary.length > 1000,
-		framesInDetails: d.frames,
-		economics: d.economics,
-		estFramesZeroWhenNoVision: d.est_frame_tokens === 0 && d.pages === 0,
-	};
-	// A text-archive summary is self-contained: pi renders compactionSummary
-	// rows natively, so the context hook must leave it untouched (no frames to
-	// rehydrate, nothing to rebuild).
-	const summaryRow = { role: "compactionSummary", summary: res.compaction.summary, tokensBefore: 50_000, timestamp: 8 };
-	const ctxEvent = { type: "context", messages: [summaryRow] };
-	const hookRes = (await contextHook(ctxEvent, makeCtx())) as unknown;
-	const row = ctxEvent.messages[0] as { role: string; summary?: string };
+	const legacyEntry = { type: "compaction", summary: "[SNAPCOMPACT CONTEXT RESTORE] legacy row", tokensBefore: 42, timestamp: 3, details: { _snapcompact_archive: { v: 1, engine: "snapcompact", marker: "[SNAPCOMPACT CONTEXT RESTORE]", archive: "[TOOL bash ERROR] AssertionError: devices is {}", frames: 0, omitted_oldest: 0, shape: "claude", model: "openai/gpt-5.2-mini", middle_messages: 2, economics: "text_archive" } } };
+	visionModel = { provider: "openai", id: "gpt-5.2-mini", input: ["text"] };
+	sessionEntries = [...sessionEntries, legacyEntry];
+	const legacyRow = { role: "compactionSummary", summary: legacyEntry.summary, tokensBefore: 42, timestamp: 8 };
+	const ctxEvent = { type: "context", messages: [legacyRow] };
+	await contextHook(ctxEvent, makeCtx());
+	const rebuilt = (ctxEvent.messages as { role: string; content: { type: string; text?: string }[] }[])[0];
 	results.nonvisionContextRow = {
-		hookReturnsNothing: hookRes === undefined,
-		rowLeftAsSummary: row.role === "compactionSummary",
-		archiveReadableFromSummary: row.summary!.includes("[TOOL bash ERROR]"),
+		rowRole: rebuilt.role,
+		archiveInline: JSON.stringify(rebuilt.content).includes("AssertionError: devices is {}"),
+		noImageParts: rebuilt.content.every((c) => c.type !== "image"),
 	};
 }
 

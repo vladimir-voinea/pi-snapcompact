@@ -55,16 +55,17 @@ switch) — same text + shape ⇒ same bytes.
 
 ## Fallback ladder
 
-1. **Vision model, frames shrink the middle ≥ 10%** → frames ride on the summary row.
-2. **Vision model, frames lose the economics** → bounded text archive inline.
-3. **No image input, `nonvision_mode: "text_archive"`** → bounded text archive inline.
-4. **No image input, `nonvision_mode: "llm_summary"` (default)** → pass handed to
-   pi's built-in compaction, exactly as stock pi.
+1. **Vision model** → bitmap frames, always. No shrink-gate, no text fallback:
+   the frames are the exact record, and no LLM summarizer is ever invoked.
+2. **No image input** → pass handed to pi's built-in (LLM-summary) compaction,
+   exactly as stock pi.
 
 If the active model loses image input after a frames pass, the `context` hook
 carries the bounded *text* archive inline instead of a bare lead-in (an
 improvement over the Hermes original, which kept only the lead-in until the next
-compaction).
+compaction). Legacy v1.x `text_archive` compaction entries rehydrate the same
+way: their durable archive text is re-rendered to frames on vision models and
+carried inline on non-vision ones.
 
 ## Configuration
 
@@ -76,15 +77,11 @@ Under the `snapcompact` key in `~/.pi/agent/settings.json` or project
 | `max_frames` | `48` | Cap per compaction; oldest pages are dropped first. |
 | `shape` | `auto` | Force a frame shape: `claude`, `claude-hires`, `gemini`, `openai`, `glm`, `patch28`. |
 | `assume_vision` | `auto` | Force the vision path on/off regardless of model metadata. |
-| `nonvision_mode` | `llm_summary` | `llm_summary` (default pi compaction) or `text_archive`. |
 | `archive_source_max_chars` | `48000` | Bound of the durable archive text kept in `details`. |
-| `nonvision_max_chars` | `24000` | Bound of the inline text archive. |
 | `tool_result_max_chars` | `2000` | Tool result bound (head+tail kept). |
 | `tool_result_head_ratio` | `0.6` | Head share of a truncated tool result. |
 | `tool_arg_max_chars` | `500` | Per-value cap of tool-call arguments. |
 | `tool_call_max_chars` | `2000` | Per-call cap of tool-call arguments. |
-| `min_middle_tokens` | `1200` | Skip compactions of smaller middles (unless manual). |
-| `min_shrink_ratio` | `0.9` | Frames must shrink the middle's estimate by ≥ 10%. |
 | `compact_at_percent` | `100` | Compact when context usage ≥ this % of the **live** window (from `turn_end`). `100` defers to pi's own `reserveTokens` trigger — set it below 100 for window-relative control regardless of which model is active. Pair the model with `reserveTokens: 0` in `compaction.modelOverrides` so the absolute check never fires first. |
 
 Compaction *triggers* (`reserveTokens`, `keepRecentTokens`) stay pi's own — see

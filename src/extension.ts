@@ -7,11 +7,9 @@
  *   serialized to bounded dense text, rasterized onto model-shaped 1-bit PNG frames
  *   of 8x16 pixel glyphs, and the compaction summary row carries the archive. The
  *   pass is local, deterministic and LLM-free — so it is also safe for overflow
- *   recovery. On models without image input the pass is handed to pi's default
- *   compaction (`nonvision_mode: "llm_summary"`, the default) or, with
- *   `nonvision_mode: "text_archive"`, to a deterministic bounded text archive;
- *   when frames would not actually shrink the transcript it falls back to that
- *   same bounded text archive.
+ *   recovery. Vision-capable models always get frames, unconditionally (the
+ *   frames are the exact record — no shrink-gate fallback to text); models
+ *   without image input are handed to pi's default (LLM-summary) compaction.
  * - `context` re-attaches the archive before every LLM call: the summary row is
  *   rebuilt as a user message whose content carries the compaction summary text
  *   plus the frame images (or the bounded archive text when the active model has
@@ -29,12 +27,10 @@
  * key in `~/.pi/agent/settings.json` (or project `.pi/settings.json`), with
  * `PI_SNAPCOMPACT_*` env overrides:
  *
- *   max_frames (48), shape (auto), assume_vision (auto), nonvision_mode
- *   (llm_summary | text_archive), archive_source_max_chars (48000),
- *   nonvision_max_chars (24000), tool_result_max_chars (2000),
+ *   max_frames (48), shape (auto), assume_vision (auto),
+ *   archive_source_max_chars (48000), tool_result_max_chars (2000),
  *   tool_result_head_ratio (0.6), tool_arg_max_chars (500),
- *   min_middle_tokens (1200), min_shrink_ratio (0.9),
- *   compact_at_percent (100)
+ *   tool_call_max_chars (2000), compact_at_percent (100)
  */
 
 import { createHash } from "node:crypto";
@@ -47,7 +43,7 @@ import * as render from "./render.ts";
 import { SNAPCOMPACT_ARCHIVE_KEY, boundArchiveText, serializeMessages, type LlmMessage } from "./serialize.ts";
 import { SHAPE_NAMES, frameRows, frameTokens, resolveShape, type Shape } from "./shapes.ts";
 
-const snapVersion = "1.1.1";
+const snapVersion = "1.2.0";
 
 // pi's compaction-summary framing (dist/core/messages.js, v1.6.0). Not exported
 // from the public entry; inlined so the rebuilt summary row reads exactly like a
@@ -63,30 +59,16 @@ const FRAME_NOTE =
 	"top-left to bottom-right, oldest first. They are an exact record, not a " +
 	"summary — consult them before claiming anything from earlier in the session " +
 	"is unknown.";
-const NONVISION_HEADER =
-	MARKER +
-	" The earlier part of this conversation was " +
-	"compacted with no vision model active, so a bounded text archive follows " +
-	"(head and tail kept, middle elided).\n\n";
-const TEXT_ARCHIVE_HEADER =
-	MARKER +
-	" The earlier part of this conversation was " +
-	"compacted into a bounded text archive instead of bitmap frames (head and " +
-	"tail kept, middle elided).\n\n";
 
 const DEFAULTS: Record<string, unknown> = {
 	max_frames: 48,
 	shape: "auto",
 	assume_vision: "auto", // auto | true | false
-	nonvision_mode: "llm_summary", // llm_summary (default compaction) | text_archive
 	archive_source_max_chars: 48_000,
-	nonvision_max_chars: 24_000,
 	tool_result_max_chars: 2_000,
 	tool_result_head_ratio: 0.6,
 	tool_arg_max_chars: 500,
 	tool_call_max_chars: 2_000,
-	min_middle_tokens: 1_200, // never bother below this
-	min_shrink_ratio: 0.9, // frames must shrink the middle by >= 10%
 	compact_at_percent: 100, // compact when usage >= pct of window (100 = pi's own trigger governs)
 };
 
@@ -101,7 +83,7 @@ interface SnapCompactDetails {
 	shape: string;
 	model: string;
 	middle_messages: number;
-	economics: "frames" | "text_archive";
+	economics: "frames"; // vision => frames, always
 	/** Gate economics, persisted so every compaction is auditable in the session file. */
 	est_middle_tokens?: number; // estimated tokens of the serialized middle
 	est_frame_tokens?: number; // what the planned frames would bill (pages x frameTokens)
@@ -141,7 +123,10 @@ function readSettingsFile(path: string): Record<string, unknown> {
 
 function loadConfig(cwd: string): Record<string, unknown> {
 	const cfg: Record<string, unknown> = { ...DEFAULTS };
-	const globalSettings = readSettingsFile(join(homedir(), ".pi", "agent", "settings.json"));
+	// Isolated runs (PI_CODING_AGENT_DIR) must read THAT agent dir's settings,
+	// not the invoking user's — same semantics as pi itself.
+	const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+	const globalSettings = readSettingsFile(join(agentDir, "settings.json"));
 	const projectSettings = readSettingsFile(resolve(cwd, ".pi", "settings.json"));
 	for (const source of [globalSettings, projectSettings]) {
 		const sc = source.snapcompact;
@@ -235,7 +220,7 @@ let lastStatus: {
 	model: string;
 	shape: string | null;
 	vision: boolean | null;
-	last_pass: { economics: string; frames: number; omitted: number; middle: number } | null;
+	last_pass: { frames: number; omitted: number; middle: number } | null;
 } = { model: "", shape: null, vision: null, last_pass: null };
 
 /** In-memory frame stash keyed by hash(summary); LRU-bounded. */
@@ -306,19 +291,18 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
 		dbg(`before_compact reason=${event.reason} middle=${event.preparation?.messagesToSummarize?.length ?? "?"} prefix=${event.preparation?.turnPrefixMessages?.length ?? "?"} model=${modelId(ctx)}`);
 		const cfg = loadConfig(ctx.cwd);
-		const { preparation, reason, branchEntries, signal } = event;
+		const { preparation, branchEntries, signal } = event;
 		if (signal?.aborted) return { cancel: true };
 
 		const vision = visionCapable(ctx, cfg);
 		lastStatus.vision = vision;
 		lastStatus.model = modelId(ctx);
 
-		const nonvisionMode = str(cfg, "nonvision_mode", "llm_summary").toLowerCase();
-		if (!vision && nonvisionMode !== "text_archive") {
-			// No image input on the active model and the default path is selected:
-			// hand the whole pass to pi's built-in compaction, exactly as stock pi
-			// would. No frames, no stash for this pass.
-			lastStatus.last_pass = { economics: "llm_summary", frames: 0, omitted: 0, middle: 0 };
+		if (!vision) {
+			// No image input on the active model: hand the whole pass to pi's
+			// built-in (LLM-summary) compaction, exactly as stock pi would. No
+			// frames, no stash for this pass.
+			lastStatus.last_pass = { frames: 0, omitted: 0, middle: 0 };
 			return undefined;
 		}
 
@@ -343,58 +327,39 @@ export default function (pi: ExtensionAPI) {
 
 		const shape = resolveShape(modelId(ctx), str(cfg, "shape", "auto"));
 		const maxFrames = Math.trunc(num(cfg, "max_frames", 48));
-		const minMiddleTokens = num(cfg, "min_middle_tokens", 1_200);
-		const minShrinkRatio = num(cfg, "min_shrink_ratio", 0.9);
 
-		let useFrames = false;
-		let pngs: Uint8Array[] = [];
-		let omitted = 0;
-		let pages = 0;
-		let estFrames = 0;
+		// Vision => frames, always: the frames are the exact record, so there is
+		// no shrink-gate economic fallback and no LLM summarizer anywhere in this
+		// path. nFrames === 0 is unreachable for a non-empty archive; guard anyway
+		// and defer to pi's own compaction.
 		const estMiddle = estimateMessagesTokensRough(middleMsgs);
 		const rowsPerFrame = frameRows(shape);
-		// Cheap pre-gate: middles smaller than ~2 image tokens-worth can never
-		// shrink into frames; skip without side effects (hermes compress() gate).
-		const floor = vision ? Math.max(minMiddleTokens, 2 * frameTokens(shape, rowsPerFrame)) : minMiddleTokens;
-		const gate = reason === "manual" || estMiddle >= floor; // manual /compact: honor the user (hermes: force)
-		if (vision && archive.trim() && gate) {
-			const [nFrames, omittedPlan] = render.planFrames(archive, shape, maxFrames);
-			pages = nFrames;
-			// Frames must shrink the middle by >= min_shrink_ratio of its tokens.
-			estFrames = nFrames * frameTokens(shape, rowsPerFrame);
-			useFrames = Boolean(nFrames && estMiddle && estFrames < estMiddle * minShrinkRatio);
-			if (useFrames) {
-				[pngs, omitted] = render.renderFrames(archive, shape, maxFrames);
-			}
-		}
+		const [nFrames, omittedPlan] = render.planFrames(archive, shape, maxFrames);
+		const estFrames = nFrames * frameTokens(shape, rowsPerFrame);
+		if (nFrames === 0) return undefined;
+		const [pngs, omitted] = render.renderFrames(archive, shape, maxFrames);
 
-		const summaryText = useFrames
-			? MARKER + " The earlier part of this conversation was compacted. The images attached to this message are its archive: dense pages of pixel text read top-left to bottom-right, oldest first. They are exact, not paraphrased. Read them like text before answering questions about earlier work, decisions, file paths, or instructions."
-			: (vision ? TEXT_ARCHIVE_HEADER : NONVISION_HEADER) +
-				boundArchiveText(archive, num(cfg, "nonvision_max_chars", 24_000));
+		const summaryText = MARKER + " The earlier part of this conversation was compacted. The images attached to this message are its archive: dense pages of pixel text read top-left to bottom-right, oldest first. They are exact, not paraphrased. Read them like text before answering questions about earlier work, decisions, file paths, or instructions.";
 
 		const details: SnapCompactDetails = {
 			v: 1,
 			engine: "snapcompact",
 			marker: MARKER,
 			archive: boundArchiveText(archive, num(cfg, "archive_source_max_chars", 48_000)),
-			frames: useFrames ? pngs.length : 0,
+			frames: pngs.length,
 			omitted_oldest: omitted,
 			shape: shape.name,
 			model: modelId(ctx),
 			middle_messages: middleMsgs.length,
-			economics: useFrames ? "frames" : "text_archive",
+			economics: "frames",
 			est_middle_tokens: Math.round(estMiddle),
 			est_frame_tokens: Math.round(estFrames),
-			pages,
+			pages: nFrames,
 		};
 
-		if (useFrames) {
-			stashPut(sha256(summaryText), { pngs: pngs.map((b) => Buffer.from(b).toString("base64")), omitted, shape, details });
-		}
+		stashPut(sha256(summaryText), { pngs: pngs.map((b) => Buffer.from(b).toString("base64")), omitted, shape, details });
 		lastStatus.shape = shape.name;
 		lastStatus.last_pass = {
-			economics: details.economics,
 			frames: details.frames,
 			omitted: details.omitted_oldest,
 			middle: details.middle_messages,
@@ -455,8 +420,10 @@ export default function (pi: ExtensionAPI) {
 	// possible" -- compaction only when the context is at hard-window capacity
 	// (pair with reserveTokens: 0 so pi's absolute check never pre-empts it).
 	pi.on("turn_end", async (_event, ctx) => {
+		// 100 (default) = defer entirely to pi's own reserveTokens trigger.
 		const cfg = loadConfig(ctx.cwd);
 		const pct = num(cfg, "compact_at_percent", 100);
+		if (pct >= 100) return;
 		const usage = ctx.getContextUsage();
 		if (!usage?.percent || usage.percent < pct) return;
 		dbg(`turn_end: usage ${usage.tokens}/${usage.contextWindow} = ${usage.percent}% >= ${pct}% -> compact()`);
@@ -474,11 +441,10 @@ export default function (pi: ExtensionAPI) {
 				`model: ${model ? `${model.provider}/${model.id}` : "(none)"}`,
 				`vision input: ${visionCapable(ctx, cfg) ? "yes" : "no"}`,
 				`shape: ${shape ? `${shape.name} (${shape.frame_w / shape.advance} cols x ${frameRows(shape)} rows/frame)` : "?"}`,
-				`max_frames: ${num(cfg, "max_frames", 48)}  nonvision_mode: ${str(cfg, "nonvision_mode", "llm_summary")}`,
-				`compact_at_percent: ${num(cfg, "compact_at_percent", 100)} (100 = defer to pi's own reserve)`,
+				`max_frames: ${num(cfg, "max_frames", 48)}  compact_at_percent: ${num(cfg, "compact_at_percent", 100)} (100 = defer to pi's own reserve)`,
 				`frames cached in memory: ${stash.size}`,
 				lastStatus.last_pass
-					? `last pass: ${lastStatus.last_pass.economics} (${lastStatus.last_pass.frames} frame(s), ${lastStatus.last_pass.omitted} oldest page(s) omitted, ${lastStatus.last_pass.middle} middle messages)`
+					? `last pass: ${lastStatus.last_pass.middle} middle message(s) -> ${lastStatus.last_pass.frames} frame(s), ${lastStatus.last_pass.omitted} oldest page(s) omitted`
 					: "last pass: none yet",
 				"",
 				"Frame images ride on the compaction summary row at request time; the",
