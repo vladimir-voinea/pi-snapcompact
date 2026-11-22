@@ -6,6 +6,10 @@
 	"keywords": [
 		"pi-package"
 	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/vladimir-voinea/pi-snapcompact.git"
+	},
 	"license": "GPL-2.0-or-later WITH Font-exception-2.0",
 	"pi": {
 		"extensions": [
