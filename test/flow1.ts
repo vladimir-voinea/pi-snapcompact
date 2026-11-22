@@ -26,13 +26,17 @@ let visionModel: unknown = {
 
 const tmpDir = mkdtempSync(join(tmpdir(), "snapcompact-test-"));
 
+let usagePercent: number | null = null;
+let compactCalls = 0;
+
 function makeCtx() {
 	return {
 		cwd: tmpDir,
 		mode: "json",
 		hasUI: false,
 		ui: { notify: (message: string) => void notifies.push(message) },
-		getContextUsage: () => undefined,
+		getContextUsage: () => (usagePercent === null ? undefined : { tokens: 1000, contextWindow: 1000, percent: usagePercent }),
+		compact: () => { compactCalls++; },
 		get model() {
 			return visionModel;
 		},
@@ -170,6 +174,36 @@ const results: Record<string, unknown> = {};
 		rowLeftAsSummary: row.role === "compactionSummary",
 		archiveReadableFromSummary: row.summary!.includes("[TOOL bash ERROR]"),
 	};
+}
+
+// --- turn_end percentage trigger -----------------------------------------------
+{
+	const turnEnd = handlers["turn_end"]![0]!;
+
+	// default (100): never fires ctx.compact() itself -- at 100% pi's own trigger governs
+	usagePercent = 100;
+	compactCalls = 0;
+	await turnEnd({}, makeCtx());
+	results.pctDefault = { at100: compactCalls === 0 };
+
+	// opt-in percent (e.g. 90): fires only at/above the threshold
+	process.env.PI_SNAPCOMPACT_COMPACT_AT_PERCENT = "90";
+	usagePercent = 89.9;
+	compactCalls = 0;
+	await turnEnd({}, makeCtx());
+	const notYet = compactCalls === 0;
+	usagePercent = 90;
+	await turnEnd({}, makeCtx());
+	const atThreshold = compactCalls === 1;
+	usagePercent = 99.9;
+	await turnEnd({}, makeCtx());
+	const above = compactCalls === 2;
+	// no usage info -> never fires
+	usagePercent = null;
+	await turnEnd({}, makeCtx());
+	const noUsage = compactCalls === 2;
+	delete process.env.PI_SNAPCOMPACT_COMPACT_AT_PERCENT;
+	results.pctTrigger = { notYet, atThreshold, above, noUsage };
 }
 
 // --- /snapcompile command reports status --------------------------------------

@@ -87,6 +87,7 @@ const DEFAULTS: Record<string, unknown> = {
 	tool_call_max_chars: 2_000,
 	min_middle_tokens: 1_200, // never bother below this
 	min_shrink_ratio: 0.9, // frames must shrink the middle by >= 10%
+	compact_at_percent: 100, // compact when usage >= pct of window (100 = pi's own trigger governs)
 };
 
 /** Interface of the archive payload this extension stores on compaction entries. */
@@ -436,6 +437,20 @@ export default function (pi: ExtensionAPI) {
 			changed = true;
 		}
 		return changed ? { messages } : undefined;
+	});
+
+	// Percentage-based late compaction: pi's trigger is absolute (reserveTokens in
+	// tokens), which fires proportionally early on small windows; this fires from
+	// the live window of whatever model is active. 100 (default) means "as late as
+	// possible" -- compaction only when the context is at hard-window capacity
+	// (pair with reserveTokens: 0 so pi's absolute check never pre-empts it).
+	pi.on("turn_end", async (_event, ctx) => {
+		const cfg = loadConfig(ctx.cwd);
+		const pct = num(cfg, "compact_at_percent", 100);
+		const usage = ctx.getContextUsage();
+		if (!usage?.percent || usage.percent < pct) return;
+		dbg(`turn_end: usage ${usage.tokens}/${usage.contextWindow} = ${usage.percent}% >= ${pct}% -> compact()`);
+		ctx.compact();
 	});
 
 	pi.registerCommand("snapcompact", {

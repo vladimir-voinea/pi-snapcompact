@@ -85,6 +85,7 @@ Under the `snapcompact` key in `~/.pi/agent/settings.json` or project
 | `tool_call_max_chars` | `2000` | Per-call cap of tool-call arguments. |
 | `min_middle_tokens` | `1200` | Skip compactions of smaller middles (unless manual). |
 | `min_shrink_ratio` | `0.9` | Frames must shrink the middle's estimate by ≥ 10%. |
+| `compact_at_percent` | `100` | Compact when context usage ≥ this % of the **live** window (from `turn_end`). `100` defers to pi's own `reserveTokens` trigger — set it below 100 for window-relative control regardless of which model is active. Pair the model with `reserveTokens: 0` in `compaction.modelOverrides` so the absolute check never fires first. |
 
 Compaction *triggers* (`reserveTokens`, `keepRecentTokens`) stay pi's own — see
 pi's compaction docs.
