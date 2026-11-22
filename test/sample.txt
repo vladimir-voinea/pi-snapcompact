@@ -1,0 +1,25 @@
+[USER]
+Fix the failing test in tests/test_compress.py. The symptom is KeyError 'token' when the device map is empty.
+
+[ASSISTANT]
+[TOOL_CALL read(file="tests/test_compress.py")]
+[TOOL read tests/test_compress.py]
+def test_compress_empty_device_map():
+    devices = load_devices()
+    assert devices["token"] == "abc123"   # fails: devices is {}
+...[truncated 1132 chars]...
+
+[ASSISTANT]
+The map is empty because load_devices() returns {} when ~/.config/devmap.yaml is missing. Let me check the loader.
+[TOOL_CALL bash(command="grep -n "def load_devices" -A12 src/devices.py")]
+
+CJK width probe: 対応するデータが見つかりません (wide glyphs = two cells each).
+
+[TOOL bash]
+    42  def load_devices():
+    43      path = os.path.expanduser("~/.config/devmap.yaml")
+    44      if not os.path.exists(path):
+...[elided 84 chars]...
+
+[USER]
+Right — add a fallback to environment var DEVMAP_TOKEN and update the test to stub it.
