@@ -1,3 +1,11 @@
+pi-snapcompact — bitmap-frame context compression for pi
+Copyright (C) 2026 vladimir-voinea
+
+A TypeScript port of hermes-snapcompact by vimona3ds
+(https://github.com/vimona3ds/hermes-snapcompact). Ships a glyph cache
+extracted from GNU Unifont, licensed GPL-2.0-or-later with the GNU Font
+Embedding Exception — see assets/fonts/NOTICE-Unifont.
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 2, June 1991
 
