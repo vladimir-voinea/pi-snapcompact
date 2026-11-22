@@ -33,8 +33,8 @@
  *   (llm_summary | text_archive), archive_source_max_chars (48000),
  *   nonvision_max_chars (24000), tool_result_max_chars (2000),
  *   tool_result_head_ratio (0.6), tool_arg_max_chars (500),
- *   tool_call_max_chars (2000), min_middle_tokens (1200),
- *   min_shrink_ratio (0.9)
+ *   min_middle_tokens (1200), min_shrink_ratio (0.9),
+ *   compact_at_percent (100)
  */
 
 import { createHash } from "node:crypto";
@@ -47,7 +47,7 @@ import * as render from "./render.ts";
 import { SNAPCOMPACT_ARCHIVE_KEY, boundArchiveText, serializeMessages, type LlmMessage } from "./serialize.ts";
 import { SHAPE_NAMES, frameRows, frameTokens, resolveShape, type Shape } from "./shapes.ts";
 
-const snapVersion = "1.0.0";
+const snapVersion = "1.1.1";
 
 // pi's compaction-summary framing (dist/core/messages.js, v1.6.0). Not exported
 // from the public entry; inlined so the rebuilt summary row reads exactly like a
@@ -102,6 +102,10 @@ interface SnapCompactDetails {
 	model: string;
 	middle_messages: number;
 	economics: "frames" | "text_archive";
+	/** Gate economics, persisted so every compaction is auditable in the session file. */
+	est_middle_tokens?: number; // estimated tokens of the serialized middle
+	est_frame_tokens?: number; // what the planned frames would bill (pages x frameTokens)
+	pages?: number; // planned frame count (0 when the pre-gate declined)
 }
 
 interface Stash {
@@ -345,6 +349,8 @@ export default function (pi: ExtensionAPI) {
 		let useFrames = false;
 		let pngs: Uint8Array[] = [];
 		let omitted = 0;
+		let pages = 0;
+		let estFrames = 0;
 		const estMiddle = estimateMessagesTokensRough(middleMsgs);
 		const rowsPerFrame = frameRows(shape);
 		// Cheap pre-gate: middles smaller than ~2 image tokens-worth can never
@@ -353,8 +359,9 @@ export default function (pi: ExtensionAPI) {
 		const gate = reason === "manual" || estMiddle >= floor; // manual /compact: honor the user (hermes: force)
 		if (vision && archive.trim() && gate) {
 			const [nFrames, omittedPlan] = render.planFrames(archive, shape, maxFrames);
+			pages = nFrames;
 			// Frames must shrink the middle by >= min_shrink_ratio of its tokens.
-			const estFrames = nFrames * frameTokens(shape, rowsPerFrame);
+			estFrames = nFrames * frameTokens(shape, rowsPerFrame);
 			useFrames = Boolean(nFrames && estMiddle && estFrames < estMiddle * minShrinkRatio);
 			if (useFrames) {
 				[pngs, omitted] = render.renderFrames(archive, shape, maxFrames);
@@ -377,6 +384,9 @@ export default function (pi: ExtensionAPI) {
 			model: modelId(ctx),
 			middle_messages: middleMsgs.length,
 			economics: useFrames ? "frames" : "text_archive",
+			est_middle_tokens: Math.round(estMiddle),
+			est_frame_tokens: Math.round(estFrames),
+			pages,
 		};
 
 		if (useFrames) {
@@ -465,6 +475,7 @@ export default function (pi: ExtensionAPI) {
 				`vision input: ${visionCapable(ctx, cfg) ? "yes" : "no"}`,
 				`shape: ${shape ? `${shape.name} (${shape.frame_w / shape.advance} cols x ${frameRows(shape)} rows/frame)` : "?"}`,
 				`max_frames: ${num(cfg, "max_frames", 48)}  nonvision_mode: ${str(cfg, "nonvision_mode", "llm_summary")}`,
+				`compact_at_percent: ${num(cfg, "compact_at_percent", 100)} (100 = defer to pi's own reserve)`,
 				`frames cached in memory: ${stash.size}`,
 				lastStatus.last_pass
 					? `last pass: ${lastStatus.last_pass.economics} (${lastStatus.last_pass.frames} frame(s), ${lastStatus.last_pass.omitted} oldest page(s) omitted, ${lastStatus.last_pass.middle} middle messages)`

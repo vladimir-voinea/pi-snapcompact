@@ -110,6 +110,9 @@ const results: Record<string, unknown> = {};
 		shape: d.shape,
 		middle: d.middle_messages,
 		boundedArchiveChars: d.archive.length,
+		estMiddlePersisted: (d.est_middle_tokens as number) > 0,
+		estFramesPersisted: (d.est_frame_tokens as number) > 0,
+		pagesPersisted: (d.pages as number) >= d.frames,
 		thinkingLeak: d.archive.includes("internal scratch"),
 	};
 	sessionEntries = [{ type: "compaction", summary: res.compaction.summary, tokensBefore: 90_000, timestamp: Date.now(), details: res.compaction.details }];
@@ -161,6 +164,7 @@ const results: Record<string, unknown> = {};
 		carriesArchiveText: res.compaction.summary.length > 1000,
 		framesInDetails: d.frames,
 		economics: d.economics,
+		estFramesZeroWhenNoVision: d.est_frame_tokens === 0 && d.pages === 0,
 	};
 	// A text-archive summary is self-contained: pi renders compactionSummary
 	// rows natively, so the context hook must leave it untouched (no frames to
